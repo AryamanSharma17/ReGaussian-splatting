@@ -12,6 +12,7 @@
 from argparse import ArgumentParser, Namespace
 import sys
 import os
+from typing import Optional
 
 class GroupParams:
     pass
@@ -54,6 +55,9 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.flag_to_save_param: Optional[bool] = False
+        self.flag_to_load_param: Optional[bool] = False
+        self.path_to_param : Optional[str] = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

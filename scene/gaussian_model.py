@@ -16,10 +16,11 @@ from torch import nn
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import RGB2SH, SH2RGB
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from arguments import ModelParams
 
 class GaussianModel:
 
@@ -121,30 +122,49 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
-        self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, args : ModelParams):
+        if args.flag_to_load_param is True:
+            xyz = torch.tensor(np.load(os.path.join(args.path_to_param, "xyz.npy"))).float().cuda()
+            f_dc = torch.tensor(np.load(os.path.join(args.path_to_param, "f_dc.npy"))).float().cuda()
+            f_rest = torch.tensor(np.load(os.path.join(args.path_to_param, "f_rest.npy"))).float().cuda()
+            opacity = torch.tensor(np.load(os.path.join(args.path_to_param, "opacity.npy"))).float().cuda()
+            scale = torch.tensor(np.load(os.path.join(args.path_to_param, "scale.npy"))).float().cuda()
+            rotation = torch.tensor(np.load(os.path.join(args.path_to_param, "rotation.npy"))).float().cuda()
+            max_radii2D = torch.tensor(np.load(os.path.join(args.path_to_param, "max_radii2D.npy"))).float().cuda()
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+            self._xyz = nn.Parameter(xyz.requires_grad_(True))
+            self._features_dc = nn.Parameter(f_dc.transpose(1, 2).contiguous().requires_grad_(True))
+            self._features_rest = nn.Parameter(f_rest.transpose(1, 2).contiguous().requires_grad_(True))
+            self._opacity = nn.Parameter(opacity.requires_grad_(True))
+            self._scaling = nn.Parameter(scale.requires_grad_(True))
+            self._rotation = nn.Parameter(rotation.requires_grad_(True))
+            self.max_radii2D = nn.Parameter(max_radii2D.requires_grad_(True))
+            self.orig_xyz = self._xyz.clone().detach()
+            print("Number of points at initialisation : ", xyz.shape[0])
+            print("Loading parameters from different scene")
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
-        rots[:, 0] = 1
+        else:
+            self.spatial_lr_scale = spatial_lr_scale
+            fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+            fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+            features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+            features[:, :3, 0 ] = fused_color
+            features[:, 3:, 1:] = 0.0
+            print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+            dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+            scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+            rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+            rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+            opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+            self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+            self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+            self._scaling = nn.Parameter(scales.requires_grad_(True))
+            self._rotation = nn.Parameter(rots.requires_grad_(True))
+            self._opacity = nn.Parameter(opacities.requires_grad_(True))
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -188,16 +208,41 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, args : ModelParams):
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_dc_str = self._features_dc.detach().transpose(1, 2).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest_str = self._features_rest.detach().transpose(1, 2).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        max_radii2D = self.max_radii2D.detach().cpu().numpy()
+        if args.flag_to_save_param is True:
+            if not os.path.exists(os.path.dirname(args.path_to_param)):
+                mkdir_p(os.path.dirname(args.path_to_param))
+            print("Saving parameters to ", os.path.dirname(args.path_to_param))
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "xyz.npy"), xyz)
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "f_dc.npy"), f_dc_str)
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "f_rest.npy"), f_rest_str)
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "opacity.npy"), opacities)
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "scale.npy"), scale)
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "rotation.npy"), rotation)
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "max_radii2D.npy"), max_radii2D)
+            red = np.clip(np.abs(SH2RGB(f_dc_str[:, 0, None]) * 255), 0, 255).astype(np.uint8)
+            green = np.clip(np.abs(SH2RGB(f_dc_str[:, 1, None]) * 255), 0, 255).astype(np.uint8)
+            blue = np.clip(np.abs(SH2RGB(f_dc_str[:, 2, None]) * 255), 0, 255).astype(np.uint8)
+            colors = np.concatenate((red, green, blue), axis=1).squeeze(axis=2)
+            np.save(os.path.join(os.path.dirname(args.path_to_param), "colors.npy"), colors)
+
+            ele = np.empty(xyz.shape[0], dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('r', 'u1'), ('g', 'u1'), ('b', 'u1')])
+            attrib = np.concatenate((xyz, colors), axis=1)
+            ele[:] = list(map(tuple, attrib))
+            el = PlyElement.describe(ele, 'vertex')
+            PlyData([el], text=True).write(os.path.join(os.path.dirname(args.path_to_param), "point_cloud.ply"))
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
@@ -346,7 +391,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, args : ModelParams, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -354,7 +399,14 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
-
+        if args.flag_to_load_param is True:
+            in_orig_masks = torch.all(torch.isin(self.get_xyz, self.orig_xyz), dim=-1)
+            selected_pts_mask_dup = selected_pts_mask.clone()
+            selected_pts_mask = selected_pts_mask & ~in_orig_masks
+            if torch.equal(selected_pts_mask_dup, selected_pts_mask):
+                print("\nNo new points to add")
+        else:
+            selected_pts_mask = selected_pts_mask        
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
@@ -371,9 +423,17 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, args : ModelParams):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        if args.flag_to_load_param is True:
+            in_orig_masks = torch.all(torch.isin(self.get_xyz, self.orig_xyz), dim=-1)
+            selected_pts_mask_dup = selected_pts_mask.clone()
+            selected_pts_mask = selected_pts_mask & ~in_orig_masks
+            if torch.equal(selected_pts_mask_dup, selected_pts_mask):
+                print("\nNo new points to add")
+        else:
+            selected_pts_mask = selected_pts_mask
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
@@ -386,18 +446,26 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, args : ModelParams):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(grads, max_grad, extent, args)
+        self.densify_and_split(grads, max_grad, extent, args)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        # if args.flag_to_load_param is True:
+        #     in_orig_masks = torch.all(torch.isin(self.get_xyz, self.orig_xyz), dim=-1)
+        #     prune_mask_dup = prune_mask.clone()
+        #     prune_mask = prune_mask & ~in_orig_masks
+        #     if torch.equal(prune_mask_dup, prune_mask):
+        #         print("\nNo new points to add")
+        # else:
+        #     prune_mask = prune_mask
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
